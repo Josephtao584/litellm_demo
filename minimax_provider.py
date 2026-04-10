@@ -172,11 +172,26 @@ class MiniMaxCustomAuth(CustomLLM):
         messages = kwargs.get("messages", [])
 
         # Debug: log all keys to find where tools are
-        print(f"[MiniMax DEBUG] kwargs keys: {list(kwargs.keys())}")
-        if "tools" in kwargs:
-            print(f"[MiniMax DEBUG] tools found: {len(kwargs['tools'])} tools")
-        else:
-            print("[MiniMax DEBUG] NO tools in kwargs")
+        import pprint
+        debug_keys = []
+        for k, v in kwargs.items():
+            if k == "optional_params":
+                debug_keys.append(("optional_params", v))
+            elif k == "litellm_params":
+                # Just summarize
+                debug_keys.append(("litellm_params_keys", list(v.keys()) if isinstance(v, dict) else type(v).__name__))
+            elif k == "logging_obj":
+                debug_keys.append(("logging_obj", type(v).__name__))
+            else:
+                debug_keys.append((k, v))
+        for k, v in debug_keys:
+            print(f"[MiniMax DEBUG] {k}={pprint.pformat(v)[:300]}")
+        if "tools" not in kwargs:
+            # Check nested locations
+            for loc in ["optional_params", "litellm_params"]:
+                if loc in kwargs and isinstance(kwargs[loc], dict) and "tools" in kwargs[loc]:
+                    print(f"[MiniMax DEBUG] tools found in {loc}")
+            print("[MiniMax DEBUG] NO tools anywhere in kwargs")
 
         print(
             f"[MiniMax] -> model={TARGET_MODEL}, messages={len(messages)}, stream={stream}"
