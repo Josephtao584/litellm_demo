@@ -186,11 +186,30 @@ class MiniMaxCustomAuth(CustomLLM):
                 debug_keys.append((k, v))
         for k, v in debug_keys:
             print(f"[MiniMax DEBUG] {k}={pprint.pformat(v)[:300]}")
-        if "tools" not in kwargs:
-            # Check nested locations
-            for loc in ["optional_params", "litellm_params"]:
-                if loc in kwargs and isinstance(kwargs[loc], dict) and "tools" in kwargs[loc]:
-                    print(f"[MiniMax DEBUG] tools found in {loc}")
+
+        # Check everywhere tools could be
+        # 1. Top-level kwargs
+        tools = kwargs.get("tools")
+        # 2. optional_params (where get_optional_params puts them)
+        if not tools:
+            opt_params = kwargs.get("optional_params", {})
+            if isinstance(opt_params, dict):
+                tools = opt_params.get("tools")
+        # 3. Anthropic tools embedded in messages as tool_use/tool_result
+        if not tools:
+            messages = kwargs.get("messages", [])
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            # If there are tool results, the model was called with tools
+                            # but we lost the tool definitions. Check assistant messages for tool_use IDs
+                            break
+
+        if tools:
+            print(f"[MiniMax DEBUG] tools found: {len(tools)} tools")
+        else:
             print("[MiniMax DEBUG] NO tools anywhere in kwargs")
 
         print(
@@ -208,10 +227,17 @@ class MiniMaxCustomAuth(CustomLLM):
             "stream": stream,
         }
 
-        # Pass through optional params
+        # Pass through optional params from top-level kwargs
         for key in ("max_tokens", "temperature", "top_p", "stop", "tools", "tool_choice"):
             if key in kwargs:
                 params[key] = kwargs[key]
+
+        # Also check optional_params for tools (where LiteLLM puts them)
+        opt_params = kwargs.get("optional_params", {})
+        if isinstance(opt_params, dict):
+            for key in ("tools", "tool_choice", "max_tokens", "temperature", "top_p", "stop"):
+                if key in opt_params and key not in params:
+                    params[key] = opt_params[key]
 
         return params
 
