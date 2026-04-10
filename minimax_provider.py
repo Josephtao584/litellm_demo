@@ -275,6 +275,8 @@ class MiniMaxCustomAuth(CustomLLM):
             )
 
         for line in resp.iter_lines():
+            if isinstance(line, bytes):
+                line = line.decode("utf-8")
             line = line.strip()
             if not line or not line.startswith("data: "):
                 continue
