@@ -1,6 +1,6 @@
 # MiniMax M2.5 Proxy
 
-FastAPI 代理服务，将 MiniMax M2.5 模型 API 转换为 OpenAI 和 Anthropic 兼容格式，可直接对接 Claude Code 等客户端。
+基于 LiteLLM 的代理服务，将 MiniMax M2.5 模型 API 转换为 OpenAI 和 Anthropic 兼容格式，可直接对接 Claude Code 等客户端。
 
 ## 功能
 
@@ -8,8 +8,8 @@ FastAPI 代理服务，将 MiniMax M2.5 模型 API 转换为 OpenAI 和 Anthropi
 - 支持 OpenAI 格式 `/v1/chat/completions`
 - 支持 Anthropic 格式 `/v1/messages`（兼容 Claude Code）
 - 所有请求统一转发至 MiniMax `/api/v2/chat/completions`
-- Anthropic 响应格式自动转换
 - 支持 stream 流式输出
+- 基于 LiteLLM 代理服务器，内置日志、重试、限流等生产特性
 
 ## 快速开始
 
@@ -43,11 +43,12 @@ PROXY_KEY=sk-test-key
 | `MINIMAX_PASSWORD` | 密码 |
 | `PROXY_KEY` | 代理 API Key（默认 `sk-test-key`） |
 | `TARGET_MODEL` | 目标模型名（默认 `MiniMax-M2.5`） |
+| `PORT` | 代理端口（默认 `4000`） |
 
 ### 3. 启动 Proxy
 
 ```bash
-python proxy.py
+python entrypoint.py
 ```
 
 启动后监听 `http://0.0.0.0:4000`。
@@ -72,7 +73,6 @@ curl http://localhost:4000/v1/chat/completions \
 ```bash
 curl http://localhost:4000/v1/messages \
   -H "Authorization: Bearer sk-test-key" \
-  -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet-4-20250514",
@@ -81,7 +81,7 @@ curl http://localhost:4000/v1/messages \
   }'
 ```
 
-> Anthropic 格式下模型名会被自动映射为 `MiniMax-M2.5`，无需关心实际传入的模型名。
+> 所有请求的模型名都会被映射为实际的 `MiniMax-M2.5` 模型，客户端传入的模型名仅作标识。
 
 **对接 Claude Code**
 
@@ -93,13 +93,14 @@ curl http://localhost:4000/v1/messages \
 |------|------|------|
 | `/v1/chat/completions` | POST | OpenAI 兼容格式 |
 | `/v1/messages` | POST | Anthropic 格式 |
-| `/v1/messages/count_tokens` | POST | Token 计数（固定返回 0） |
 
 ## 项目结构
 
 ```
 .
-├── proxy.py              # 代理服务主文件
+├── entrypoint.py         # 启动入口
+├── minimax_provider.py   # MiniMax 自定义 LiteLLM Provider
+├── litellm_config.yaml   # LiteLLM 代理配置
 ├── .env.example          # 环境变量模板
 ├── requirements.txt      # 依赖
 └── README.md
