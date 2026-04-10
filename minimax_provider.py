@@ -134,11 +134,15 @@ class MiniMaxCustomAuth(CustomLLM):
 
     def streaming(self, *args, **kwargs):
         """Sync streaming — delegates to litellm's OpenAI provider."""
-        return litellm.completion(**self._build_params(kwargs, stream=True))
+        response = litellm.completion(**self._build_params(kwargs, stream=True))
+        for chunk in response:
+            yield chunk
 
     async def astreaming(self, *args, **kwargs):
         """Async streaming — delegates to litellm's OpenAI provider."""
-        return await litellm.acompletion(**self._build_params(kwargs, stream=True))
+        response = await litellm.acompletion(**self._build_params(kwargs, stream=True))
+        async for chunk in response:
+            yield chunk
 
     def _build_params(self, kwargs: dict, stream: bool = False) -> dict:
         """Build litellm.completion params with token auth and OpenAI-compatible config."""
