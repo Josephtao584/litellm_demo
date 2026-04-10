@@ -54,7 +54,7 @@ class TokenManager:
         data = resp.json()
         if data.get("status") != "success":
             raise ValueError(f"登录失败: {data}")
-        token = data["cloudDragonTokens"]["x-auth-token"]
+        token = data["cloudDragonTokens"]["authToken"]
         print("[Token] 令牌获取成功")
         return token
 
