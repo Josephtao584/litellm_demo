@@ -14,6 +14,7 @@ import requests as http_requests
 
 import litellm
 from litellm import CustomLLM
+from litellm.types.utils import GenericStreamingChunk
 
 # ──────────────────────────────────────────────
 # TokenManager
@@ -136,13 +137,34 @@ class MiniMaxCustomAuth(CustomLLM):
         """Sync streaming — delegates to litellm's OpenAI provider."""
         response = litellm.completion(**self._build_params(kwargs, stream=True))
         for chunk in response:
-            yield chunk
+            yield self._to_generic_chunk(chunk)
 
     async def astreaming(self, *args, **kwargs):
         """Async streaming — delegates to litellm's OpenAI provider."""
         response = await litellm.acompletion(**self._build_params(kwargs, stream=True))
         async for chunk in response:
-            yield chunk
+            yield self._to_generic_chunk(chunk)
+
+    @staticmethod
+    def _to_generic_chunk(chunk) -> GenericStreamingChunk:
+        """Convert litellm streaming chunk to GenericStreamingChunk."""
+        text = ""
+        finish_reason = ""
+        is_finished = False
+        if chunk.choices:
+            choice = chunk.choices[0]
+            delta = getattr(choice, "delta", None)
+            text = getattr(delta, "content", None) or ""
+            finish_reason = getattr(choice, "finish_reason", None) or ""
+            is_finished = finish_reason != ""
+        return GenericStreamingChunk(
+            text=text,
+            is_finished=is_finished,
+            finish_reason=finish_reason,
+            index=0,
+            tool_use=None,
+            usage=None,
+        )
 
     def _build_params(self, kwargs: dict, stream: bool = False) -> dict:
         """Build litellm.completion params with token auth and OpenAI-compatible config."""
