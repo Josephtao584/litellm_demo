@@ -12,7 +12,7 @@ import os
 import threading
 import time
 
-import httpx
+import requests as http_requests
 
 from litellm import CustomLLM
 from litellm.types.utils import GenericStreamingChunk, ModelResponse, Usage
@@ -44,7 +44,7 @@ class TokenManager:
 
     def _fetch_token(self) -> str:
         print("[Token] 正在获取认证令牌...")
-        resp = httpx.post(
+        resp = http_requests.post(
             f"{self.base_api_1}/login/v4/secureLogin",
             json={"user": self.user, "password": self.password},
             headers={"Content-Type": "application/json"},
@@ -54,7 +54,7 @@ class TokenManager:
         data = resp.json()
         if data.get("status") != "success":
             raise ValueError(f"登录失败: {data}")
-        token = data["cloudDragonTokens"]["authToken"]
+        token = data["cloudDragonTokens"]["x-auth-token"]
         print("[Token] 令牌获取成功")
         return token
 
@@ -197,8 +197,8 @@ class MiniMaxCustomAuth(CustomLLM):
             f"[MiniMax] -> model={TARGET_MODEL}, messages={len(messages)}, stream={stream}"
         )
 
-        resp = httpx.post(url, json=payload, headers=headers, timeout=180)
-        if not resp.is_success:
+        resp = http_requests.post(url, json=payload, headers=headers, timeout=180)
+        if not resp.ok:
             raise RuntimeError(
                 f"MiniMax API error {resp.status_code}: {resp.text[:500]}"
             )
@@ -266,60 +266,61 @@ class MiniMaxCustomAuth(CustomLLM):
             f"[MiniMax Stream] -> model={TARGET_MODEL}, messages={len(messages)}"
         )
 
-        with httpx.stream(
-            "POST", url, json=payload, headers=headers, timeout=180
-        ) as resp:
-            if not resp.is_success:
-                raise RuntimeError(
-                    f"MiniMax API error {resp.status_code}: {resp.text[:500]}"
-                )
+        resp = http_requests.post(
+            url, json=payload, headers=headers, stream=True, timeout=180
+        )
+        if not resp.ok:
+            raise RuntimeError(
+                f"MiniMax API error {resp.status_code}: {resp.text[:500]}"
+            )
 
-            for line in resp.iter_lines():
-                line = line.strip()
-                if not line or not line.startswith("data: "):
-                    continue
+        for line in resp.iter_lines():
+            line = line.strip()
+            if not line or not line.startswith("data: "):
+                continue
 
-                data_str = line[6:]  # Remove "data: " prefix
-                if data_str == "[DONE]":
-                    yield GenericStreamingChunk(
-                        text="",
-                        is_finished=True,
-                        finish_reason="stop",
-                        index=0,
-                        tool_use=None,
-                        usage=None,
-                    )
-                    break
-
-                try:
-                    chunk_data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
-                choices = chunk_data.get("choices", [])
-                if not choices:
-                    continue
-
-                delta = choices[0].get("delta", {})
-                finish_reason = choices[0].get("finish_reason")
-
-                usage_data = chunk_data.get("usage")
-                usage = None
-                if usage_data:
-                    usage = {
-                        "completion_tokens": usage_data.get("completion_tokens", 0),
-                        "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                        "total_tokens": usage_data.get("total_tokens", 0),
-                    }
-
+            data_str = line[6:]  # Remove "data: " prefix
+            if data_str == "[DONE]":
                 yield GenericStreamingChunk(
-                    text=delta.get("content", "") or "",
-                    is_finished=finish_reason is not None,
-                    finish_reason=finish_reason or "",
-                    index=choices[0].get("index", 0),
-                    tool_use=delta.get("tool_calls"),
-                    usage=usage,
+                    text="",
+                    is_finished=True,
+                    finish_reason="stop",
+                    index=0,
+                    tool_use=None,
+                    usage=None,
                 )
+                break
+
+            try:
+                chunk_data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            choices = chunk_data.get("choices", [])
+            if not choices:
+                continue
+
+            delta = choices[0].get("delta", {})
+            finish_reason = choices[0].get("finish_reason")
+
+            usage_data = chunk_data.get("usage")
+            usage = None
+            if usage_data:
+                usage = {
+                    "completion_tokens": usage_data.get("completion_tokens", 0),
+                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                    "total_tokens": usage_data.get("total_tokens", 0),
+                }
+
+            yield GenericStreamingChunk(
+                text=delta.get("content", "") or "",
+                is_finished=finish_reason is not None,
+                finish_reason=finish_reason or "",
+                index=choices[0].get("index", 0),
+                tool_use=delta.get("tool_calls"),
+                usage=usage,
+            )
+        resp.close()
 
     async def astreaming(self, *args, **kwargs):
         """Async streaming — yields GenericStreamingChunk objects."""
