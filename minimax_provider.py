@@ -171,6 +171,13 @@ class MiniMaxCustomAuth(CustomLLM):
         token = token_manager.get_token()
         messages = kwargs.get("messages", [])
 
+        # Debug: log all keys to find where tools are
+        print(f"[MiniMax DEBUG] kwargs keys: {list(kwargs.keys())}")
+        if "tools" in kwargs:
+            print(f"[MiniMax DEBUG] tools found: {len(kwargs['tools'])} tools")
+        else:
+            print("[MiniMax DEBUG] NO tools in kwargs")
+
         print(
             f"[MiniMax] -> model={TARGET_MODEL}, messages={len(messages)}, stream={stream}"
         )
