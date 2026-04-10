@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
 MiniMax Custom LiteLLM Provider
-Handles MiniMax authentication (user/password → x-auth-token) and provides
-a CustomLLM implementation for LiteLLM proxy.
+Handles MiniMax authentication (user/password → x-auth-token) and delegates
+actual API calls to LiteLLM's built-in OpenAI-compatible provider.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import threading
-import time
 
 import requests as http_requests
 
+import litellm
 from litellm import CustomLLM
-from litellm.types.utils import GenericStreamingChunk, ModelResponse, Usage
 
 # ──────────────────────────────────────────────
-# TokenManager (migrated from proxy.py)
+# TokenManager
 # ──────────────────────────────────────────────
 
 
@@ -114,222 +112,60 @@ def _safe_init():
 _safe_init()
 
 
-def ensure_token_ready() -> None:
-    """Ensure the token manager has been initialized (call after import)."""
-    # Token is already initialized on module import
-    pass
-
-
 # ──────────────────────────────────────────────
 # MiniMax CustomLLM Provider
+# Delegates to litellm's built-in OpenAI-compatible provider
 # ──────────────────────────────────────────────
 
 
 class MiniMaxCustomAuth(CustomLLM):
-    """Custom LiteLLM provider for MiniMax with token-based authentication."""
+    """Custom LiteLLM provider that injects token auth and delegates to OpenAI provider."""
 
     def __init__(self) -> None:
         super().__init__()
 
-    def completion(self, *args, **kwargs) -> ModelResponse:
-        """Sync completion — delegates to async implementation via sync wrapper."""
-        import asyncio
+    def completion(self, *args, **kwargs):
+        """Sync completion — delegates to litellm's OpenAI provider."""
+        return litellm.completion(**self._build_params(kwargs))
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+    async def acompletion(self, *args, **kwargs):
+        """Async completion — delegates to litellm's OpenAI provider."""
+        return await litellm.acompletion(**self._build_params(kwargs))
 
-        if loop and loop.is_running():
-            # Running inside an event loop, use sync HTTP
-            return self._call_minimax_sync(
-                messages=kwargs.get("messages", []),
-                model=kwargs.get("model", TARGET_MODEL),
-                stream=False,
-                temperature=kwargs.get("temperature"),
-                max_tokens=kwargs.get("max_tokens", 4096),
-            )
-        else:
-            return asyncio.run(
-                self.acompletion(*args, **kwargs)
-            )
+    def streaming(self, *args, **kwargs):
+        """Sync streaming — delegates to litellm's OpenAI provider."""
+        return litellm.completion(**self._build_params(kwargs, stream=True))
 
-    async def acompletion(self, *args, **kwargs) -> ModelResponse:
-        """Async completion."""
-        messages = kwargs.get("messages", [])
-        model = kwargs.get("model", TARGET_MODEL)
-        temperature = kwargs.get("temperature")
-        max_tokens = kwargs.get("max_tokens", 4096)
+    async def astreaming(self, *args, **kwargs):
+        """Async streaming — delegates to litellm's OpenAI provider."""
+        return await litellm.acompletion(**self._build_params(kwargs, stream=True))
 
-        return self._call_minimax_sync(
-            messages=messages,
-            model=model,
-            stream=False,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-
-    def _call_minimax_sync(
-        self,
-        messages: list[dict],
-        model: str,
-        stream: bool,
-        temperature: float | None,
-        max_tokens: int,
-    ) -> ModelResponse:
-        """Call MiniMax API and return a ModelResponse."""
+    def _build_params(self, kwargs: dict, stream: bool = False) -> dict:
+        """Build litellm.completion params with token auth and OpenAI-compatible config."""
         token = token_manager.get_token()
-        headers = {
-            "x-auth-token": token,
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": TARGET_MODEL,
-            "messages": messages,
-            "stream": stream,
-            "max_tokens": max_tokens,
-        }
-        if temperature is not None:
-            payload["temperature"] = temperature
+        messages = kwargs.get("messages", [])
 
-        url = f"{BASE_API_2}/api/v2/chat/completions"
         print(
             f"[MiniMax] -> model={TARGET_MODEL}, messages={len(messages)}, stream={stream}"
         )
 
-        resp = http_requests.post(url, json=payload, headers=headers, timeout=180)
-        if not resp.ok:
-            raise RuntimeError(
-                f"MiniMax API error {resp.status_code}: {resp.text[:500]}"
-            )
-
-        data = resp.json()
-        return self._parse_response(data, model)
-
-    def _parse_response(self, data: dict, model: str) -> ModelResponse:
-        """Parse MiniMax response into a LiteLLM ModelResponse."""
-        choices = data.get("choices", [])
-        parsed_choices = []
-        for choice in choices:
-            message = choice.get("message", {})
-            parsed_choices.append(
-                {
-                    "finish_reason": choice.get("finish_reason", "stop"),
-                    "index": choice.get("index", 0),
-                    "message": {
-                        "role": message.get("role", "assistant"),
-                        "content": message.get("content", ""),
-                    },
-                }
-            )
-
-        usage_data = data.get("usage", {})
-        usage = Usage(
-            prompt_tokens=usage_data.get("prompt_tokens", 0),
-            completion_tokens=usage_data.get("completion_tokens", 0),
-            total_tokens=usage_data.get("total_tokens", 0),
-        )
-
-        response = ModelResponse(
-            id=data.get("id", ""),
-            created=int(time.time()),
-            model=model,
-            object="chat.completion",
-            choices=parsed_choices,
-            usage=usage,
-        )
-        return response
-
-    def streaming(self, *args, **kwargs):
-        """Sync streaming — yields GenericStreamingChunk objects."""
-        messages = kwargs.get("messages", [])
-        model = kwargs.get("model", TARGET_MODEL)
-        temperature = kwargs.get("temperature")
-        max_tokens = kwargs.get("max_tokens", 4096)
-
-        token = token_manager.get_token()
-        headers = {
-            "x-auth-token": token,
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": TARGET_MODEL,
+        params = {
+            "model": f"openai/{TARGET_MODEL}",
             "messages": messages,
-            "stream": True,
-            "max_tokens": max_tokens,
+            "api_base": f"{BASE_API_2}/api/v2",
+            "api_key": "not-needed",  # OpenAI provider requires an api_key, but we use x-auth-token
+            "extra_headers": {
+                "x-auth-token": token,
+            },
+            "stream": stream,
         }
-        if temperature is not None:
-            payload["temperature"] = temperature
 
-        url = f"{BASE_API_2}/api/v2/chat/completions"
-        print(
-            f"[MiniMax Stream] -> model={TARGET_MODEL}, messages={len(messages)}"
-        )
+        # Pass through optional params
+        for key in ("max_tokens", "temperature", "top_p", "stop", "tools", "tool_choice"):
+            if key in kwargs:
+                params[key] = kwargs[key]
 
-        resp = http_requests.post(
-            url, json=payload, headers=headers, stream=True, timeout=180
-        )
-        if not resp.ok:
-            raise RuntimeError(
-                f"MiniMax API error {resp.status_code}: {resp.text[:500]}"
-            )
-
-        for line in resp.iter_lines():
-            if isinstance(line, bytes):
-                line = line.decode("utf-8")
-            line = line.strip()
-            if not line or not line.startswith("data: "):
-                continue
-
-            data_str = line[6:]  # Remove "data: " prefix
-            if data_str == "[DONE]":
-                yield GenericStreamingChunk(
-                    text="",
-                    is_finished=True,
-                    finish_reason="stop",
-                    index=0,
-                    tool_use=None,
-                    usage=None,
-                )
-                break
-
-            try:
-                chunk_data = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
-
-            choices = chunk_data.get("choices", [])
-            if not choices:
-                continue
-
-            delta = choices[0].get("delta", {})
-            finish_reason = choices[0].get("finish_reason")
-
-            usage_data = chunk_data.get("usage")
-            usage = None
-            if usage_data:
-                usage = {
-                    "completion_tokens": usage_data.get("completion_tokens", 0),
-                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                    "total_tokens": usage_data.get("total_tokens", 0),
-                }
-
-            yield GenericStreamingChunk(
-                text=delta.get("content", "") or "",
-                is_finished=finish_reason is not None,
-                finish_reason=finish_reason or "",
-                index=choices[0].get("index", 0),
-                tool_use=delta.get("tool_calls"),
-                usage=usage,
-            )
-        resp.close()
-
-    async def astreaming(self, *args, **kwargs):
-        """Async streaming — yields GenericStreamingChunk objects."""
-        # For now, use sync streaming wrapped in async
-        # A full async implementation would use httpx.AsyncClient.stream()
-        for chunk in self.streaming(*args, **kwargs):
-            yield chunk
+        return params
 
 
 # ──────────────────────────────────────────────
