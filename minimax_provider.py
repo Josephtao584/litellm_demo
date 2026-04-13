@@ -131,7 +131,21 @@ class MiniMaxCustomAuth(CustomLLM):
 
     async def acompletion(self, *args, **kwargs):
         """Async completion — delegates to litellm's OpenAI provider."""
-        return await litellm.acompletion(**self._build_params(kwargs))
+        response = await litellm.acompletion(**self._build_params(kwargs))
+        # Debug: log response structure
+        if hasattr(response, 'choices') and response.choices:
+            choice = response.choices[0]
+            msg = getattr(choice, 'message', None)
+            tc = getattr(msg, 'tool_calls', None) if msg else None
+            content = getattr(msg, 'content', '') if msg else ''
+            has_tool_calls = tc and len(tc) > 0
+            print(f"[MiniMax DEBUG] response: finish_reason={choice.finish_reason}, tool_calls={has_tool_calls}, content_len={len(content or '')}")
+            if has_tool_calls:
+                for i, t in enumerate(tc):
+                    print(f"[MiniMax DEBUG]   tool_call[{i}]: name={getattr(t.function, 'name', '?')}, args={getattr(t.function, 'arguments', '')[:200]}")
+            elif content and len(content) < 500:
+                print(f"[MiniMax DEBUG]   content={content[:300]}")
+        return response
 
     def streaming(self, *args, **kwargs):
         """Sync streaming — delegates to litellm's OpenAI provider."""
