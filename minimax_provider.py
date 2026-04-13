@@ -233,34 +233,84 @@ def _convert_tool_calls_response(tool_calls) -> list:
     return content_blocks
 
 
-def _convert_streaming_tool_calls(tool_calls) -> dict:
-    """Convert streaming delta tool_calls to Anthropic tool_use format."""
+def _convert_streaming_tool_calls_openai(tool_calls) -> list:
+    """Convert streaming delta tool_calls to list of OpenAI format dicts for tool_use."""
     if not tool_calls:
-        return None
-    blocks = []
+        return []
+    result = []
     for tc in tool_calls:
         index = getattr(tc, "index", 0)
         tc_id = getattr(tc, "id", None)
         func = getattr(tc, "function", None)
         name = getattr(func, "name", None) if func else None
         args = getattr(func, "arguments", "") if func else ""
-        block = {"index": index}
+        block = {"index": index, "type": "function"}
         if tc_id:
             block["id"] = tc_id
-        if name:
-            block["name"] = name
-        if args:
-            try:
-                block["input"] = json.loads(args) if isinstance(args, str) else args
-            except (json.JSONDecodeError, TypeError):
-                block["input"] = {}
-        blocks.append(block)
-    return {"tool_use": blocks} if blocks else None
+        if name or args:
+            block["function"] = {}
+            if name:
+                block["function"]["name"] = name
+            if args:
+                block["function"]["arguments"] = args
+        result.append(block)
+    return result
 
 
 # ──────────────────────────────────────────────
 # MiniMax CustomLLM Provider
 # ──────────────────────────────────────────────
+
+
+def _model_response_to_generic_chunks(chunk):
+    """Convert a ModelResponse streaming chunk into GenericStreamingChunk dicts."""
+    if not hasattr(chunk, "choices") or not chunk.choices:
+        return
+
+    choice = chunk.choices[0]
+    delta = getattr(choice, "delta", None)
+    if delta is None:
+        return
+
+    content = getattr(delta, "content", None) or ""
+    finish_reason = getattr(choice, "finish_reason", None) or ""
+    is_finished = finish_reason != ""
+    tool_calls = getattr(delta, "tool_calls", None)
+
+    if tool_calls and len(tool_calls) > 0:
+        # Yield one chunk per tool_call
+        for tc in tool_calls:
+            tc_index = getattr(tc, "index", 0)
+            func = getattr(tc, "function", None)
+            name = getattr(func, "name", "") if func else ""
+            args = getattr(func, "arguments", "") if func else ""
+            tool_use = {"type": "function", "index": tc_index}
+            tc_id = getattr(tc, "id", None)
+            if tc_id:
+                tool_use["id"] = tc_id
+            if name or args:
+                tool_use["function"] = {}
+                if name:
+                    tool_use["function"]["name"] = name
+                if args:
+                    tool_use["function"]["arguments"] = args
+            yield {
+                "text": "",
+                "is_finished": is_finished,
+                "finish_reason": finish_reason,
+                "index": tc_index,
+                "tool_use": tool_use,
+                "usage": None,
+            }
+    else:
+        yield {
+            "text": content,
+            "is_finished": is_finished,
+            "finish_reason": finish_reason,
+            "index": 0,
+            "tool_use": None,
+            "usage": None,
+        }
 
 
 class MiniMaxCustomAuth(CustomLLM):
@@ -282,18 +332,20 @@ class MiniMaxCustomAuth(CustomLLM):
         return self._convert_response(response)
 
     def streaming(self, *args, **kwargs):
-        """Sync streaming."""
+        """Sync streaming — yields GenericStreamingChunk dicts."""
         params = self._build_params(kwargs, stream=True)
         response = litellm.completion(**params)
         for chunk in response:
-            yield self._to_generic_chunk(chunk)
+            for gc in _model_response_to_generic_chunks(chunk):
+                yield gc
 
     async def astreaming(self, *args, **kwargs):
-        """Async streaming."""
+        """Async streaming — yields GenericStreamingChunk dicts."""
         params = self._build_params(kwargs, stream=True)
         response = await litellm.acompletion(**params)
         async for chunk in response:
-            yield self._to_generic_chunk(chunk)
+            for gc in _model_response_to_generic_chunks(chunk):
+                yield gc
 
     def _build_params(self, kwargs: dict, stream: bool) -> dict:
         """Build litellm.completion params with token auth and OpenAI-compatible config."""
@@ -380,10 +432,10 @@ class MiniMaxCustomAuth(CustomLLM):
             text = getattr(delta, "content", None) or ""
             finish_reason = getattr(choice, "finish_reason", None) or ""
             is_finished = finish_reason != ""
-            # Pass through tool_calls so LiteLLM can handle Anthropic conversion
+            # Pass through tool_calls in OpenAI format for LiteLLM to convert
             delta_tool_calls = getattr(delta, "tool_calls", None)
             if delta_tool_calls:
-                tool_use = _convert_streaming_tool_calls(delta_tool_calls)
+                tool_use = _convert_streaming_tool_calls_openai(delta_tool_calls)
         return GenericStreamingChunk(
             text=text,
             is_finished=is_finished,
