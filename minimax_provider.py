@@ -16,7 +16,7 @@ import requests as http_requests
 
 import litellm
 from litellm import CustomLLM
-from litellm.types.utils import GenericStreamingChunk, ModelResponse, Usage
+from litellm.types.utils import ModelResponse, Usage
 
 # ──────────────────────────────────────────────
 # TokenManager
@@ -233,30 +233,6 @@ def _convert_tool_calls_response(tool_calls) -> list:
     return content_blocks
 
 
-def _convert_streaming_tool_calls_openai(tool_calls) -> list:
-    """Convert streaming delta tool_calls to list of OpenAI format dicts for tool_use."""
-    if not tool_calls:
-        return []
-    result = []
-    for tc in tool_calls:
-        index = getattr(tc, "index", 0)
-        tc_id = getattr(tc, "id", None)
-        func = getattr(tc, "function", None)
-        name = getattr(func, "name", None) if func else None
-        args = getattr(func, "arguments", "") if func else ""
-        block = {"index": index, "type": "function"}
-        if tc_id:
-            block["id"] = tc_id
-        if name or args:
-            block["function"] = {}
-            if name:
-                block["function"]["name"] = name
-            if args:
-                block["function"]["arguments"] = args
-        result.append(block)
-    return result
-
-
 # ──────────────────────────────────────────────
 # MiniMax CustomLLM Provider
 # ──────────────────────────────────────────────
@@ -418,32 +394,6 @@ class MiniMaxCustomAuth(CustomLLM):
                     f"[MiniMax] response: {len(tool_use_blocks)} tool_use blocks converted to content"
                 )
         return response
-
-    @staticmethod
-    def _to_generic_chunk(chunk) -> GenericStreamingChunk:
-        """Convert litellm streaming chunk to GenericStreamingChunk."""
-        text = ""
-        finish_reason = ""
-        is_finished = False
-        tool_use = None
-        if chunk.choices:
-            choice = chunk.choices[0]
-            delta = getattr(choice, "delta", None)
-            text = getattr(delta, "content", None) or ""
-            finish_reason = getattr(choice, "finish_reason", None) or ""
-            is_finished = finish_reason != ""
-            # Pass through tool_calls in OpenAI format for LiteLLM to convert
-            delta_tool_calls = getattr(delta, "tool_calls", None)
-            if delta_tool_calls:
-                tool_use = _convert_streaming_tool_calls_openai(delta_tool_calls)
-        return GenericStreamingChunk(
-            text=text,
-            is_finished=is_finished,
-            finish_reason=finish_reason,
-            index=0,
-            tool_use=tool_use,
-            usage=None,
-        )
 
 
 # ──────────────────────────────────────────────
