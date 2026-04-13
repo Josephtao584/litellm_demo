@@ -3,7 +3,6 @@
 MiniMax Custom LiteLLM Provider
 Handles MiniMax authentication (user/password → x-auth-token) and delegates
 actual API calls to LiteLLM's built-in OpenAI-compatible provider.
-Includes Anthropic↔OpenAI tool conversion for Claude Code compatibility.
 """
 
 from __future__ import annotations
@@ -102,7 +101,6 @@ token_manager = TokenManager(BASE_API_1, MINIMAX_USER, MINIMAX_PASSWORD)
 
 
 def _safe_init():
-    """Safely initialize token manager, logging errors but not crashing on bad URLs."""
     try:
         token_manager.init_token()
         token_manager.start_refresh_loop()
@@ -116,7 +114,7 @@ _safe_init()
 
 
 # ──────────────────────────────────────────────
-# Anthropic ↔ OpenAI conversion helpers
+# Anthropic → OpenAI conversion helpers
 # ──────────────────────────────────────────────
 
 
@@ -127,7 +125,6 @@ def _convert_messages(messages: list) -> list:
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
-
         if role == "system":
             if isinstance(content, str):
                 system_content.append(content)
@@ -136,9 +133,7 @@ def _convert_messages(messages: list) -> list:
                     if isinstance(block, dict) and block.get("type") == "text":
                         system_content.append(block["text"])
             continue
-
         if isinstance(content, list):
-            # Check if all blocks are text — flatten to string for OpenAI
             text_parts = []
             for block in content:
                 if isinstance(block, dict):
@@ -149,12 +144,9 @@ def _convert_messages(messages: list) -> list:
                 elif isinstance(block, str):
                     text_parts.append(block)
             content = "\n".join(text_parts)
-
         converted.append({"role": role, "content": content})
-
     if system_content:
         converted.insert(0, {"role": "system", "content": "\n".join(system_content)})
-
     return converted
 
 
@@ -166,35 +158,29 @@ def _convert_tools(tools: list) -> list | None:
     for tool in tools:
         tool_type = tool.get("type", "")
         if tool_type == "function":
-            openai_tools.append(tool)  # Already in OpenAI format
-        elif tool_type == "computer_20250124":
-            continue  # Skip computer use
-        elif tool_type == "web_search_20250305":
-            continue  # Skip web search
+            openai_tools.append(tool)
+        elif tool_type in ("computer_20250124", "web_search_20250305"):
+            continue
         else:
-            # Try to convert Anthropic format: {"name": "...", "input_schema": {...}, "description": "..."}
             name = tool.get("name", "")
             if not name:
                 continue
-            description = tool.get("description", "")
-            input_schema = tool.get("input_schema", {"type": "object", "properties": {}})
             openai_tools.append({
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": description,
-                    "parameters": input_schema,
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
                 },
             })
     return openai_tools if openai_tools else None
 
 
 def _convert_tool_choice(tool_choice) -> str | None:
-    """Convert Anthropic tool_choice to OpenAI format."""
     if not tool_choice:
         return None
     if isinstance(tool_choice, str):
-        return tool_choice  # "auto", "required", "none"
+        return tool_choice
     if isinstance(tool_choice, dict):
         tc_type = tool_choice.get("type", "")
         if tc_type == "auto":
@@ -209,28 +195,22 @@ def _convert_tool_choice(tool_choice) -> str | None:
 
 
 def _convert_tool_calls_response(tool_calls) -> list:
-    """Convert OpenAI tool_calls response to Anthropic-style tool_use content blocks."""
+    """Convert OpenAI tool_calls to Anthropic tool_use content blocks."""
     if not tool_calls:
         return []
-    content_blocks = []
+    blocks = []
     for tc in tool_calls:
         tc_id = getattr(tc, "id", f"call_{id(tc)}")
         func = getattr(tc, "function", None)
         if func:
             name = getattr(func, "name", "")
-            arguments = getattr(func, "arguments", "{}")
-            # Parse arguments to dict
+            args = getattr(func, "arguments", "{}")
             try:
-                args_dict = json.loads(arguments) if isinstance(arguments, str) else arguments
+                args_dict = json.loads(args) if isinstance(args, str) else args
             except (json.JSONDecodeError, TypeError):
                 args_dict = {}
-            content_blocks.append({
-                "type": "tool_use",
-                "id": tc_id,
-                "name": name,
-                "input": args_dict,
-            })
-    return content_blocks
+            blocks.append({"type": "tool_use", "id": tc_id, "name": name, "input": args_dict})
+    return blocks
 
 
 # ──────────────────────────────────────────────
@@ -238,104 +218,48 @@ def _convert_tool_calls_response(tool_calls) -> list:
 # ──────────────────────────────────────────────
 
 
-def _model_response_to_generic_chunks(chunk):
-    """Convert a ModelResponse streaming chunk into GenericStreamingChunk dicts."""
-    if not hasattr(chunk, "choices") or not chunk.choices:
-        return
-
-    choice = chunk.choices[0]
-    delta = getattr(choice, "delta", None)
-    if delta is None:
-        return
-
-    content = getattr(delta, "content", None) or ""
-    finish_reason = getattr(choice, "finish_reason", None) or ""
-    is_finished = finish_reason != ""
-    tool_calls = getattr(delta, "tool_calls", None)
-
-    if tool_calls and len(tool_calls) > 0:
-        # Yield one chunk per tool_call
-        for tc in tool_calls:
-            tc_index = getattr(tc, "index", 0)
-            func = getattr(tc, "function", None)
-            name = getattr(func, "name", "") if func else ""
-            args = getattr(func, "arguments", "") if func else ""
-            tool_use = {"type": "function", "index": tc_index}
-            tc_id = getattr(tc, "id", None)
-            if tc_id:
-                tool_use["id"] = tc_id
-            if name or args:
-                tool_use["function"] = {}
-                if name:
-                    tool_use["function"]["name"] = name
-                if args:
-                    tool_use["function"]["arguments"] = args
-            yield {
-                "text": "",
-                "is_finished": is_finished,
-                "finish_reason": finish_reason,
-                "index": tc_index,
-                "tool_use": tool_use,
-                "usage": None,
-            }
-    else:
-        yield {
-            "text": content,
-            "is_finished": is_finished,
-            "finish_reason": finish_reason,
-            "index": 0,
-            "tool_use": None,
-            "usage": None,
-        }
-
-
 class MiniMaxCustomAuth(CustomLLM):
-    """Custom LiteLLM provider that injects token auth and delegates to OpenAI provider."""
+    """Custom LiteLLM provider: injects x-auth-token, delegates to OpenAI provider."""
 
     def __init__(self) -> None:
         super().__init__()
 
     def completion(self, *args, **kwargs):
-        """Sync completion."""
         params = self._build_params(kwargs, stream=False)
         response = litellm.completion(**params)
         return self._convert_response(response)
 
     async def acompletion(self, *args, **kwargs):
-        """Async completion."""
         params = self._build_params(kwargs, stream=False)
         response = await litellm.acompletion(**params)
         return self._convert_response(response)
 
     def streaming(self, *args, **kwargs):
-        """Sync streaming — yields GenericStreamingChunk dicts."""
+        """Delegate to litellm.completion(openai/...), convert chunks to GenericStreamingChunk."""
         params = self._build_params(kwargs, stream=True)
         response = litellm.completion(**params)
         for chunk in response:
-            for gc in _model_response_to_generic_chunks(chunk):
+            for gc in _to_generic_chunk(chunk):
                 yield gc
 
     async def astreaming(self, *args, **kwargs):
-        """Async streaming — yields GenericStreamingChunk dicts."""
+        """Delegate to litellm.acompletion(openai/...), convert chunks to GenericStreamingChunk."""
         params = self._build_params(kwargs, stream=True)
         response = await litellm.acompletion(**params)
         async for chunk in response:
-            for gc in _model_response_to_generic_chunks(chunk):
+            for gc in _to_generic_chunk(chunk):
                 yield gc
 
     def _build_params(self, kwargs: dict, stream: bool) -> dict:
-        """Build litellm.completion params with token auth and OpenAI-compatible config."""
         token = token_manager.get_token()
         raw_messages = kwargs.get("messages", [])
         messages = _convert_messages(raw_messages)
 
-        # Get tools from wherever they are
         tools = kwargs.get("tools")
         if not tools:
             opt_params = kwargs.get("optional_params", {})
             if isinstance(opt_params, dict):
                 tools = opt_params.get("tools")
-        # Convert Anthropic tools → OpenAI tools
         openai_tools = _convert_tools(tools)
 
         tool_choice = kwargs.get("tool_choice")
@@ -355,9 +279,7 @@ class MiniMaxCustomAuth(CustomLLM):
             "messages": messages,
             "api_base": f"{BASE_API_2}/api/v2",
             "api_key": "not-needed",
-            "extra_headers": {
-                "x-auth-token": token,
-            },
+            "extra_headers": {"x-auth-token": token},
             "stream": stream,
             "max_tokens": kwargs.get("max_tokens") or kwargs.get("optional_params", {}).get("max_tokens", 4096),
         }
@@ -374,7 +296,7 @@ class MiniMaxCustomAuth(CustomLLM):
         return params
 
     def _convert_response(self, response: ModelResponse) -> ModelResponse:
-        """Convert OpenAI tool_calls in response to Anthropic tool_use format."""
+        """Convert tool_calls to Anthropic tool_use in content."""
         if not response.choices:
             return response
         for choice in response.choices:
@@ -383,21 +305,68 @@ class MiniMaxCustomAuth(CustomLLM):
                 continue
             tool_calls = getattr(message, "tool_calls", None)
             if tool_calls and len(tool_calls) > 0:
-                # Has tool_calls — convert to Anthropic tool_use content blocks
                 tool_use_blocks = _convert_tool_calls_response(tool_calls)
-                # Store as content for Anthropic consumers
                 message.content = json.dumps(tool_use_blocks, ensure_ascii=False)
                 choice.finish_reason = "tool_use"
-                # Clear tool_calls so Anthropic parser uses content instead
                 message.tool_calls = None
-                print(
-                    f"[MiniMax] response: {len(tool_use_blocks)} tool_use blocks converted to content"
-                )
         return response
 
 
-# ──────────────────────────────────────────────
-# Module-level handler instance
-# ──────────────────────────────────────────────
-
 minimax_custom_auth = MiniMaxCustomAuth()
+
+
+def _to_generic_chunk(chunk):
+    """Convert ModelResponseStream to GenericStreamingChunk dicts.
+
+    LiteLLM's CustomStreamWrapper requires GenericStreamingChunk dicts for
+    custom providers - no built-in converter exists, so we write this once.
+    Each tool_call in delta yields a separate chunk.
+    """
+    if not hasattr(chunk, "choices") or not chunk.choices:
+        return
+
+    choice = chunk.choices[0]
+    delta = getattr(choice, "delta", None)
+    if delta is None:
+        return
+
+    content = getattr(delta, "content", None) or ""
+    finish_reason = getattr(choice, "finish_reason", None) or ""
+    is_finished = finish_reason != ""
+
+    # Handle tool_calls: yield one chunk per tool_call
+    tool_calls = getattr(delta, "tool_calls", None) or []
+    for tc in tool_calls:
+        tc_index = getattr(tc, "index", 0)
+        func = getattr(tc, "function", None) or {}
+        name = getattr(func, "name", "")
+        args = getattr(func, "arguments", "")
+        tool_use = {"type": "function", "index": tc_index}
+        tc_id = getattr(tc, "id", None)
+        if tc_id:
+            tool_use["id"] = tc_id
+        if name or args:
+            tool_use["function"] = {}
+            if name:
+                tool_use["function"]["name"] = name
+            if args:
+                tool_use["function"]["arguments"] = args
+        yield {
+            "text": "",
+            "is_finished": is_finished,
+            "finish_reason": finish_reason,
+            "index": tc_index,
+            "tool_use": tool_use,
+            "usage": None,
+        }
+
+    # Handle regular content
+    if content or is_finished:
+        yield {
+            "text": content,
+            "is_finished": is_finished,
+            "finish_reason": finish_reason,
+            "index": 0,
+            "tool_use": None,
+            "usage": None,
+        }
