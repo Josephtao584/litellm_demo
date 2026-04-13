@@ -3,10 +3,12 @@
 MiniMax Custom LiteLLM Provider
 Handles MiniMax authentication (user/password → x-auth-token) and delegates
 actual API calls to LiteLLM's built-in OpenAI-compatible provider.
+Includes Anthropic↔OpenAI tool conversion for Claude Code compatibility.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 
@@ -14,7 +16,7 @@ import requests as http_requests
 
 import litellm
 from litellm import CustomLLM
-from litellm.types.utils import GenericStreamingChunk
+from litellm.types.utils import GenericStreamingChunk, ModelResponse, Usage
 
 # ──────────────────────────────────────────────
 # TokenManager
@@ -114,8 +116,125 @@ _safe_init()
 
 
 # ──────────────────────────────────────────────
+# Anthropic ↔ OpenAI conversion helpers
+# ──────────────────────────────────────────────
+
+
+def _convert_messages(messages: list) -> list:
+    """Convert Anthropic format messages to OpenAI format."""
+    converted = []
+    system_content = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        if role == "system":
+            if isinstance(content, str):
+                system_content.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        system_content.append(block["text"])
+            continue
+
+        if isinstance(content, list):
+            # Check if all blocks are text — flatten to string for OpenAI
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "image":
+                        text_parts.append("[image]")
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            content = "\n".join(text_parts)
+
+        converted.append({"role": role, "content": content})
+
+    if system_content:
+        converted.insert(0, {"role": "system", "content": "\n".join(system_content)})
+
+    return converted
+
+
+def _convert_tools(tools: list) -> list | None:
+    """Convert Anthropic format tools to OpenAI format."""
+    if not tools:
+        return None
+    openai_tools = []
+    for tool in tools:
+        tool_type = tool.get("type", "")
+        if tool_type == "function":
+            openai_tools.append(tool)  # Already in OpenAI format
+        elif tool_type == "computer_20250124":
+            continue  # Skip computer use
+        elif tool_type == "web_search_20250305":
+            continue  # Skip web search
+        else:
+            # Try to convert Anthropic format: {"name": "...", "input_schema": {...}, "description": "..."}
+            name = tool.get("name", "")
+            if not name:
+                continue
+            description = tool.get("description", "")
+            input_schema = tool.get("input_schema", {"type": "object", "properties": {}})
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": input_schema,
+                },
+            })
+    return openai_tools if openai_tools else None
+
+
+def _convert_tool_choice(tool_choice) -> str | None:
+    """Convert Anthropic tool_choice to OpenAI format."""
+    if not tool_choice:
+        return None
+    if isinstance(tool_choice, str):
+        return tool_choice  # "auto", "required", "none"
+    if isinstance(tool_choice, dict):
+        tc_type = tool_choice.get("type", "")
+        if tc_type == "auto":
+            return "auto"
+        if tc_type == "any":
+            return "required"
+        if tc_type == "tool":
+            name = tool_choice.get("tool", {}).get("name", "")
+            if name:
+                return {"type": "function", "function": {"name": name}}
+    return "auto"
+
+
+def _convert_tool_calls_response(tool_calls) -> list:
+    """Convert OpenAI tool_calls response to Anthropic-style tool_use content blocks."""
+    if not tool_calls:
+        return []
+    content_blocks = []
+    for tc in tool_calls:
+        tc_id = getattr(tc, "id", f"call_{id(tc)}")
+        func = getattr(tc, "function", None)
+        if func:
+            name = getattr(func, "name", "")
+            arguments = getattr(func, "arguments", "{}")
+            # Parse arguments to dict
+            try:
+                args_dict = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except (json.JSONDecodeError, TypeError):
+                args_dict = {}
+            content_blocks.append({
+                "type": "tool_use",
+                "id": tc_id,
+                "name": name,
+                "input": args_dict,
+            })
+    return content_blocks
+
+
+# ──────────────────────────────────────────────
 # MiniMax CustomLLM Provider
-# Delegates to litellm's built-in OpenAI-compatible provider
 # ──────────────────────────────────────────────
 
 
@@ -126,38 +245,102 @@ class MiniMaxCustomAuth(CustomLLM):
         super().__init__()
 
     def completion(self, *args, **kwargs):
-        """Sync completion — delegates to litellm's OpenAI provider."""
-        return litellm.completion(**self._build_params(kwargs))
+        """Sync completion."""
+        params = self._build_params(kwargs, stream=False)
+        response = litellm.completion(**params)
+        return self._convert_response(response)
 
     async def acompletion(self, *args, **kwargs):
-        """Async completion — delegates to litellm's OpenAI provider."""
-        response = await litellm.acompletion(**self._build_params(kwargs))
-        # Debug: log response structure
-        if hasattr(response, 'choices') and response.choices:
-            choice = response.choices[0]
-            msg = getattr(choice, 'message', None)
-            tc = getattr(msg, 'tool_calls', None) if msg else None
-            content = getattr(msg, 'content', '') if msg else ''
-            has_tool_calls = tc and len(tc) > 0
-            print(f"[MiniMax DEBUG] response: finish_reason={choice.finish_reason}, tool_calls={has_tool_calls}, content_len={len(content or '')}")
-            if has_tool_calls:
-                for i, t in enumerate(tc):
-                    print(f"[MiniMax DEBUG]   tool_call[{i}]: name={getattr(t.function, 'name', '?')}, args={getattr(t.function, 'arguments', '')[:200]}")
-            elif content and len(content) < 500:
-                print(f"[MiniMax DEBUG]   content={content[:300]}")
-        return response
+        """Async completion."""
+        params = self._build_params(kwargs, stream=False)
+        response = await litellm.acompletion(**params)
+        return self._convert_response(response)
 
     def streaming(self, *args, **kwargs):
-        """Sync streaming — delegates to litellm's OpenAI provider."""
-        response = litellm.completion(**self._build_params(kwargs, stream=True))
+        """Sync streaming."""
+        params = self._build_params(kwargs, stream=True)
+        response = litellm.completion(**params)
         for chunk in response:
             yield self._to_generic_chunk(chunk)
 
     async def astreaming(self, *args, **kwargs):
-        """Async streaming — delegates to litellm's OpenAI provider."""
-        response = await litellm.acompletion(**self._build_params(kwargs, stream=True))
+        """Async streaming."""
+        params = self._build_params(kwargs, stream=True)
+        response = await litellm.acompletion(**params)
         async for chunk in response:
             yield self._to_generic_chunk(chunk)
+
+    def _build_params(self, kwargs: dict, stream: bool) -> dict:
+        """Build litellm.completion params with token auth and OpenAI-compatible config."""
+        token = token_manager.get_token()
+        raw_messages = kwargs.get("messages", [])
+        messages = _convert_messages(raw_messages)
+
+        # Get tools from wherever they are
+        tools = kwargs.get("tools")
+        if not tools:
+            opt_params = kwargs.get("optional_params", {})
+            if isinstance(opt_params, dict):
+                tools = opt_params.get("tools")
+        # Convert Anthropic tools → OpenAI tools
+        openai_tools = _convert_tools(tools)
+
+        tool_choice = kwargs.get("tool_choice")
+        if not tool_choice:
+            opt_params = kwargs.get("optional_params", {})
+            if isinstance(opt_params, dict):
+                tool_choice = opt_params.get("tool_choice")
+        openai_tool_choice = _convert_tool_choice(tool_choice)
+
+        print(
+            f"[MiniMax] -> model={TARGET_MODEL}, messages={len(messages)}, "
+            f"stream={stream}, tools={len(openai_tools) if openai_tools else 0}"
+        )
+
+        params = {
+            "model": f"openai/{TARGET_MODEL}",
+            "messages": messages,
+            "api_base": f"{BASE_API_2}/api/v2",
+            "api_key": "not-needed",
+            "extra_headers": {
+                "x-auth-token": token,
+            },
+            "stream": stream,
+            "max_tokens": kwargs.get("max_tokens") or kwargs.get("optional_params", {}).get("max_tokens", 4096),
+        }
+
+        if openai_tools:
+            params["tools"] = openai_tools
+        if openai_tool_choice:
+            params["tool_choice"] = openai_tool_choice
+        for key in ("temperature", "top_p", "stop"):
+            val = kwargs.get(key) or kwargs.get("optional_params", {}).get(key)
+            if val is not None:
+                params[key] = val
+
+        return params
+
+    def _convert_response(self, response: ModelResponse) -> ModelResponse:
+        """Convert OpenAI tool_calls in response to Anthropic tool_use format."""
+        if not response.choices:
+            return response
+        for choice in response.choices:
+            message = getattr(choice, "message", None)
+            if not message:
+                continue
+            tool_calls = getattr(message, "tool_calls", None)
+            if tool_calls and len(tool_calls) > 0:
+                # Has tool_calls — convert to Anthropic tool_use content blocks
+                tool_use_blocks = _convert_tool_calls_response(tool_calls)
+                # Store as content for Anthropic consumers
+                message.content = json.dumps(tool_use_blocks, ensure_ascii=False)
+                choice.finish_reason = "tool_use"
+                # Clear tool_calls so Anthropic parser uses content instead
+                message.tool_calls = None
+                print(
+                    f"[MiniMax] response: {len(tool_use_blocks)} tool_use blocks converted to content"
+                )
+        return response
 
     @staticmethod
     def _to_generic_chunk(chunk) -> GenericStreamingChunk:
@@ -179,91 +362,6 @@ class MiniMaxCustomAuth(CustomLLM):
             tool_use=None,
             usage=None,
         )
-
-    def _build_params(self, kwargs: dict, stream: bool = False) -> dict:
-        """Build litellm.completion params with token auth and OpenAI-compatible config."""
-        token = token_manager.get_token()
-        messages = kwargs.get("messages", [])
-
-        # Debug: log all keys to find where tools are
-        import pprint
-        debug_keys = []
-        for k, v in kwargs.items():
-            if k == "optional_params":
-                debug_keys.append(("optional_params", v))
-            elif k == "litellm_params":
-                # Just summarize
-                debug_keys.append(("litellm_params_keys", list(v.keys()) if isinstance(v, dict) else type(v).__name__))
-            elif k == "logging_obj":
-                debug_keys.append(("logging_obj", type(v).__name__))
-            else:
-                debug_keys.append((k, v))
-        for k, v in debug_keys:
-            print(f"[MiniMax DEBUG] {k}={pprint.pformat(v)[:300]}")
-
-        # Check everywhere tools could be
-        # 1. Top-level kwargs
-        tools = kwargs.get("tools")
-        # 2. optional_params (where get_optional_params puts them)
-        if not tools:
-            opt_params = kwargs.get("optional_params", {})
-            if isinstance(opt_params, dict):
-                tools = opt_params.get("tools")
-        # 3. Anthropic tools embedded in messages as tool_use/tool_result
-        if not tools:
-            messages = kwargs.get("messages", [])
-            for msg in messages:
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_result":
-                            # If there are tool results, the model was called with tools
-                            # but we lost the tool definitions. Check assistant messages for tool_use IDs
-                            break
-
-        if tools:
-            print(f"[MiniMax DEBUG] tools found: {len(tools)} tools")
-        else:
-            print("[MiniMax DEBUG] NO tools anywhere in kwargs")
-
-        print(
-            f"[MiniMax] -> model={TARGET_MODEL}, messages={len(messages)}, stream={stream}"
-        )
-
-        params = {
-            "model": f"openai/{TARGET_MODEL}",
-            "messages": messages,
-            "api_base": f"{BASE_API_2}/api/v2",
-            "api_key": "not-needed",  # OpenAI provider requires an api_key, but we use x-auth-token
-            "extra_headers": {
-                "x-auth-token": token,
-            },
-            "stream": stream,
-        }
-
-        # Pass through optional params from top-level kwargs
-        for key in ("max_tokens", "temperature", "top_p", "stop", "tools", "tool_choice"):
-            if key in kwargs:
-                params[key] = kwargs[key]
-
-        # Also check optional_params for tools (where LiteLLM puts them)
-        opt_params = kwargs.get("optional_params", {})
-        if isinstance(opt_params, dict):
-            for key in ("tools", "tool_choice", "max_tokens", "temperature", "top_p", "stop"):
-                if key in opt_params and key not in params:
-                    params[key] = opt_params[key]
-
-        # Debug: log what we're actually sending
-        if tools:
-            print(f"[MiniMax DEBUG] tools being sent to MiniMax: {len(tools)} tools")
-            print(f"[MiniMax DEBUG] first tool: {tools[0]}")
-            # Check tool format - are they OpenAI format or Anthropic format?
-            if "input_schema" in tools[0]:
-                print("[MiniMax DEBUG] WARNING: tools are in Anthropic format (input_schema), not OpenAI format (parameters)")
-            elif "function" in tools[0] and "parameters" in tools[0].get("function", {}):
-                print("[MiniMax DEBUG] tools are in OpenAI format (function.parameters)")
-
-        return params
 
 
 # ──────────────────────────────────────────────
