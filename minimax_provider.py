@@ -253,6 +253,16 @@ class MiniMaxCustomAuth(CustomLLM):
                 if key in opt_params and key not in params:
                     params[key] = opt_params[key]
 
+        # Debug: log what we're actually sending
+        if tools:
+            print(f"[MiniMax DEBUG] tools being sent to MiniMax: {len(tools)} tools")
+            print(f"[MiniMax DEBUG] first tool: {tools[0]}")
+            # Check tool format - are they OpenAI format or Anthropic format?
+            if "input_schema" in tools[0]:
+                print("[MiniMax DEBUG] WARNING: tools are in Anthropic format (input_schema), not OpenAI format (parameters)")
+            elif "function" in tools[0] and "parameters" in tools[0].get("function", {}):
+                print("[MiniMax DEBUG] tools are in OpenAI format (function.parameters)")
+
         return params
 
 
