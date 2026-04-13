@@ -2,7 +2,8 @@
 """
 MiniMax Custom LiteLLM Provider
 Handles MiniMax authentication (user/password → x-auth-token) and delegates
-actual API calls to LiteLLM's built-in OpenAI-compatible provider.
+to LiteLLM's built-in OpenAI-compatible provider for non-streaming calls.
+Streaming uses direct HTTP to avoid OpenAI SDK streaming issues.
 """
 
 from __future__ import annotations
@@ -82,7 +83,7 @@ class TokenManager:
 
 
 # ──────────────────────────────────────────────
-# Module-level instances (initialized on import)
+# Module-level instances
 # ──────────────────────────────────────────────
 
 TARGET_MODEL = os.environ.get("TARGET_MODEL", "MiniMax-M2.5")
@@ -119,7 +120,6 @@ _safe_init()
 
 
 def _convert_messages(messages: list) -> list:
-    """Convert Anthropic format messages to OpenAI format."""
     converted = []
     system_content = []
     for msg in messages:
@@ -151,7 +151,6 @@ def _convert_messages(messages: list) -> list:
 
 
 def _convert_tools(tools: list) -> list | None:
-    """Convert Anthropic format tools to OpenAI format."""
     if not tools:
         return None
     openai_tools = []
@@ -195,7 +194,6 @@ def _convert_tool_choice(tool_choice) -> str | None:
 
 
 def _convert_tool_calls_response(tool_calls) -> list:
-    """Convert OpenAI tool_calls to Anthropic tool_use content blocks."""
     if not tool_calls:
         return []
     blocks = []
@@ -235,20 +233,15 @@ class MiniMaxCustomAuth(CustomLLM):
         return self._convert_response(response)
 
     def streaming(self, *args, **kwargs):
-        """Delegate to litellm.completion(openai/...), convert chunks to GenericStreamingChunk."""
         params = self._build_params(kwargs, stream=True)
-        response = litellm.completion(**params)
-        for chunk in response:
-            for gc in _to_generic_chunk(chunk):
-                yield gc
+        for chunk in _call_minimax_streaming(**params):
+            yield chunk
 
     async def astreaming(self, *args, **kwargs):
-        """Delegate to litellm.acompletion(openai/...), convert chunks to GenericStreamingChunk."""
+        # Same implementation - httpx stream is sync-friendly
         params = self._build_params(kwargs, stream=True)
-        response = await litellm.acompletion(**params)
-        async for chunk in response:
-            for gc in _to_generic_chunk(chunk):
-                yield gc
+        for chunk in _call_minimax_streaming(**params):
+            yield chunk
 
     def _build_params(self, kwargs: dict, stream: bool) -> dict:
         token = token_manager.get_token()
@@ -275,7 +268,7 @@ class MiniMaxCustomAuth(CustomLLM):
         )
 
         params = {
-            "model": f"openai/{TARGET_MODEL}",
+            "model": TARGET_MODEL,
             "messages": messages,
             "api_base": f"{BASE_API_2}/api/v2",
             "api_key": "not-needed",
@@ -296,7 +289,6 @@ class MiniMaxCustomAuth(CustomLLM):
         return params
 
     def _convert_response(self, response: ModelResponse) -> ModelResponse:
-        """Convert tool_calls to Anthropic tool_use in content."""
         if not response.choices:
             return response
         for choice in response.choices:
@@ -315,36 +307,88 @@ class MiniMaxCustomAuth(CustomLLM):
 minimax_custom_auth = MiniMaxCustomAuth()
 
 
-def _to_generic_chunk(chunk):
-    """Convert ModelResponseStream to GenericStreamingChunk dicts.
+# ──────────────────────────────────────────────
+# Direct HTTP streaming with GenericStreamingChunk output
+# ──────────────────────────────────────────────
 
-    LiteLLM's CustomStreamWrapper requires GenericStreamingChunk dicts for
-    custom providers - no built-in converter exists, so we write this once.
-    Each tool_call in delta yields a separate chunk.
-    """
-    if not hasattr(chunk, "choices") or not chunk.choices:
+
+def _call_minimax_streaming(model, messages, api_base, api_key, extra_headers,
+                            stream, max_tokens, tools=None, tool_choice=None,
+                            temperature=None, top_p=None, stop=None):
+    """Call MiniMax API directly via HTTP streaming, yield GenericStreamingChunk dicts."""
+    url = f"{api_base}/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        payload["tools"] = tools
+    if tool_choice:
+        payload["tool_choice"] = tool_choice
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if stop is not None:
+        payload["stop"] = stop
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    print(f"[MiniMax Stream] POST {url}")
+    resp = http_requests.post(url, json=payload, headers=headers, stream=True, timeout=180)
+    if not resp.ok:
+        raise RuntimeError(f"MiniMax API error {resp.status_code}: {resp.text[:500]}")
+
+    for line in resp.iter_lines():
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
+        line = line.strip()
+        if not line or not line.startswith("data: "):
+            continue
+        data_str = line[6:]
+        if data_str == "[DONE]":
+            yield {"text": "", "is_finished": True, "finish_reason": "stop", "index": 0, "tool_use": None, "usage": None}
+            break
+        try:
+            chunk_data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        for gc in _parse_streaming_chunk(chunk_data):
+            yield gc
+
+    resp.close()
+
+
+def _parse_streaming_chunk(chunk_data: dict):
+    """Parse an OpenAI-style SSE chunk into GenericStreamingChunk dicts."""
+    choices = chunk_data.get("choices", [])
+    if not choices:
         return
 
-    choice = chunk.choices[0]
-    delta = getattr(choice, "delta", None)
-    if delta is None:
-        return
-
-    content = getattr(delta, "content", None) or ""
-    finish_reason = getattr(choice, "finish_reason", None) or ""
+    choice = choices[0]
+    delta = choice.get("delta", {})
+    finish_reason = choice.get("finish_reason", "") or ""
     is_finished = finish_reason != ""
+    content = delta.get("content", "") or ""
 
-    # Handle tool_calls: yield one chunk per tool_call
-    tool_calls = getattr(delta, "tool_calls", None) or []
+    # Handle tool_calls in delta
+    tool_calls = delta.get("tool_calls", []) or []
     for tc in tool_calls:
-        tc_index = getattr(tc, "index", 0)
-        func = getattr(tc, "function", None) or {}
-        name = getattr(func, "name", "")
-        args = getattr(func, "arguments", "")
+        tc_index = tc.get("index", 0)
+        func = tc.get("function", {})
+        name = func.get("name", "")
+        args = func.get("arguments", "")
         tool_use = {"type": "function", "index": tc_index}
-        tc_id = getattr(tc, "id", None)
-        if tc_id:
-            tool_use["id"] = tc_id
+        if "id" in tc:
+            tool_use["id"] = tc["id"]
         if name or args:
             tool_use["function"] = {}
             if name:
